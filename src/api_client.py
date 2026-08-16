@@ -4,8 +4,7 @@
 monkeypatch it to return canned `Response` objects — nothing in this module
 touches the network.
 
-Six deliberate issues are marked BUG(n) below. `tests/test_api_client.py`
-passes today precisely because none of its tests exercise the retry path.
+Remaining deliberate issues are marked BUG(n) below.
 """
 
 from __future__ import annotations
@@ -25,22 +24,14 @@ class Response:
     headers: dict = field(default_factory=dict)
 
 
-# BUG(6): `is` used to compare integers instead of `==`/`in`. This "usually
-# works" for small literals CPython happens to intern, and quietly stops
-# working for status codes that arrive as freshly-constructed ints (e.g.
-# `int(json_value)`), which is exactly how a real HTTP client would produce
-# them — Python even emits a SyntaxWarning ("is" with a literal) for this.
 def _is_retryable(status: int) -> bool:
-    return status is 429 or status is 503  # noqa: F632 -- intentional demo bug, see BUG(6)
+    return status in (429, 503)
 
 
 def _backoff_delay(attempt: int, max_wait: float) -> float:
     """Exponential backoff, capped at `max_wait` seconds between attempts."""
 
-    # BUG(4): requirement/implementation mismatch. The docstring above (and
-    # this function's own `max_wait` parameter) promise a cap, but it is
-    # never applied — delay grows unbounded with `attempt`.
-    return 0.5 * (2 ** (attempt - 1))
+    return min(0.5 * (2 ** (attempt - 1)), max_wait)
 
 
 class ApiClient:
@@ -50,10 +41,21 @@ class ApiClient:
     def _send(self, path: str, timeout: float) -> Response:  # pragma: no cover - real I/O seam
         raise NotImplementedError("real network I/O — replace/monkeypatch in tests")
 
-    def get(self, path: str, *, timeout: float = 5.0, max_wait: float = 30.0) -> dict:
+    def get(
+        self,
+        path: str,
+        *,
+        timeout: float = 5.0,
+        max_wait: float = 30.0,
+        max_attempts: int = 5,
+    ) -> dict:
         """Fetch `path`, retrying on 429/503 with exponential backoff.
 
-        Backoff between attempts is capped at `max_wait` seconds.
+        Backoff between attempts is capped at `max_wait` seconds. A 429/503
+        response's `Retry-After` header, when present and parseable, is
+        honored instead of the computed backoff (still capped at
+        `max_wait`). Retrying stops after `max_attempts` attempts, at which
+        point an `ApiError` is raised.
         """
 
         # BUG(3): input-validation gap — a non-positive timeout is silently
@@ -61,7 +63,7 @@ class ApiClient:
         # `_send` as-is.
 
         attempt = 0
-        while True:  # BUG(1): no maximum attempt count — retries forever
+        while True:
             attempt += 1
             response = self._send(path, timeout)
 
@@ -70,8 +72,21 @@ class ApiClient:
                     raise ApiError(f"request to {path} failed with status {response.status}")
                 return response.body
 
-            # BUG(2): the server's Retry-After header is available on the
-            # response but never read — we always use our own backoff
-            # instead of honoring what the server asked for.
-            delay = _backoff_delay(attempt, max_wait)
+            if attempt >= max_attempts:
+                raise ApiError(
+                    f"request to {path} did not succeed after {attempt} attempts "
+                    f"(last status {response.status})"
+                )
+
+            retry_after = response.headers.get("Retry-After")
+            delay = None
+            if retry_after is not None:
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = None
+            if delay is None:
+                delay = _backoff_delay(attempt, max_wait)
+            delay = min(delay, max_wait)
+
             time.sleep(delay)
